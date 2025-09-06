@@ -6,6 +6,7 @@ use Exception;
 use ForGravity\Fillable_PDFs\Utils\File_Path;
 use GFAPI;
 use GFCommon;
+use GFFormsModel;
 use WP_Error;
 
 /**
@@ -225,7 +226,7 @@ class Generator {
 				continue;
 			}
 
-			$field_value = $this->get_field_value( $meta );
+                       $field_value = $this->get_field_value( $meta, $field_name );
 
 			if ( empty( $field_value ) && $field_value !== '0' ) {
 				continue;
@@ -499,28 +500,62 @@ class Generator {
 	 *
 	 * @return string
 	 */
-	public function get_field_value( $mapping ) {
+        public function get_field_value( $mapping, $field_name = '' ) {
 
-		/**
-		 * @var Generator\Field\Base $field
-		 */
-		$field_class = $this->get_field_class_name( rgar( $mapping, 'field' ) );
-		$field       = new $field_class( $this, $mapping );
+                /**
+                 * @var Generator\Field\Base $field
+                 */
+                $field_class = $this->get_field_class_name( rgar( $mapping, 'field' ) );
+                $field       = new $field_class( $this, $mapping );
 
-		$value     = $field->get_value();
-		$modifiers = $field->get_modifiers();
+                $value     = $field->get_value();
+                $modifiers = $field->get_modifiers();
 
-		// Apply legacy filters.
-		$value = gf_apply_filters( [ 'gform_addon_field_value', $this->form['id'], $field->get_field_id() ], $value, $this->form, $this->entry, $field->get_field_id(), fg_fillablepdfs()->get_slug() );
-		$value = gf_apply_filters( [ 'gform_' . fg_fillablepdfs()->get_slug() . '_field_value', $this->form['id'], $field->get_field_id() ], $value, $this->form, $this->entry, $field->get_field_id() );
+                if ( defined( 'FGFPDF_DEBUG' ) && FGFPDF_DEBUG && $field_name ) {
+                        $gf_field_id = rgar( $mapping, 'field' );
+                        $gf_field    = GFAPI::get_field( $this->form, $gf_field_id );
+                        $mapped_type = $gf_field ? $gf_field->get_input_type() : 'custom';
 
-		if ( ! empty( $modifiers ) && ! empty( $value ) ) {
-			$value = GFCommon::implode_non_blank( ',', $modifiers ) . '|' . $value;
-		}
+                        $template_meta = $this->get_template_field_meta( $field_name );
+                        $pdf_field_ft  = rgar( $template_meta, 'ft' );
+                        $pdf_field_ff  = rgar( $template_meta, 'ff' );
 
-		return $value;
+                        $raw = rgar( $this->entry, $gf_field_id );
+                        if ( is_array( $raw ) ) {
+                                error_log( '[FGFPDF] multi-file JSON=' . json_encode( $raw ) );
+                                $raw = rgar( $raw, 0 );
+                        }
 
-	}
+                        $image_path = $raw ? GFFormsModel::get_physical_file_path( $raw ) : '';
+
+                        error_log( '[FGFPDF] field=' . $field_name .
+                                ' mapperType=' . $mapped_type .
+                                ' pdfFT=' . $pdf_field_ft . ' ff=' . $pdf_field_ff .
+                                ' file=' . $image_path .
+                                ' exists=' . ( $image_path && file_exists( $image_path ) ? '1' : '0' ) .
+                                ' readable=' . ( $image_path && is_readable( $image_path ) ? '1' : '0' ) .
+                                ' mime=' . ( $image_path && file_exists( $image_path ) ? @mime_content_type( $image_path ) : '' ) .
+                                ' size=' . ( $image_path && file_exists( $image_path ) ? filesize( $image_path ) : -1 ) .
+                                ' gd=' . ( extension_loaded( 'gd' ) ? '1' : '0' ) .
+                                ' imagick=' . ( extension_loaded( 'imagick' ) ? '1' : '0' )
+                        );
+
+                        if ( ( $field instanceof Generator\Field\FileUpload || in_array( Generator\Field\Base::MODIFIER_IMAGE_FILL, $modifiers, true ) ) && ( $pdf_field_ft !== '/Btn' || ( (int) $pdf_field_ff & 65536 ) === 0 ) ) {
+                                do_action( 'fgfpdf_admin_notice', sprintf( 'Mapped field "%s" is not a push-button field. Images can only be embedded into push-button fields. Please rebuild the field as a button (Icon Only).', $field_name ) );
+                        }
+                }
+
+                // Apply legacy filters.
+                $value = gf_apply_filters( [ 'gform_addon_field_value', $this->form['id'], $field->get_field_id() ], $value, $this->form, $this->entry, $field->get_field_id(), fg_fillablepdfs()->get_slug() );
+                $value = gf_apply_filters( [ 'gform_' . fg_fillablepdfs()->get_slug() . '_field_value', $this->form['id'], $field->get_field_id() ], $value, $this->form, $this->entry, $field->get_field_id() );
+
+                if ( ! empty( $modifiers ) && ! empty( $value ) ) {
+                        $value = GFCommon::implode_non_blank( ',', $modifiers ) . '|' . $value;
+                }
+
+                return $value;
+
+        }
 
 	/**
 	 * Returns the field map for the feed, sorted by the detected template fields.
@@ -529,7 +564,7 @@ class Generator {
 	 *
 	 * @return array
 	 */
-	private function get_mappings() {
+        private function get_mappings() {
 
 		$field_map       = rgars( $this->feed, 'meta/fieldMap' );
 		$template_fields = [];
@@ -551,9 +586,47 @@ class Generator {
 		} );
 
 		// Sort field map by template field order.
-		return array_replace( array_flip( $template_fields ), $field_map );
+                return array_replace( array_flip( $template_fields ), $field_map );
 
-	}
+        }
+
+       /**
+        * Returns meta for a template field by name.
+        *
+        * @since 999
+        *
+        * @param string $field_name Template field name.
+        *
+        * @return array
+        */
+       private function get_template_field_meta( $field_name ) {
+
+               $template = $this->get_template();
+               if ( is_wp_error( $template ) ) {
+                       return [];
+               }
+
+               $meta  = rgar( $template, 'meta' );
+               $pages = rgar( $meta, 'pages' );
+               if ( ! is_array( $pages ) ) {
+                       return [];
+               }
+
+               foreach ( $pages as $page ) {
+                       $fields = rgar( $page, 'fields' );
+                       if ( ! is_array( $fields ) ) {
+                               continue;
+                       }
+                       foreach ( $fields as $field ) {
+                               if ( rgar( $field, 'name' ) === $field_name ) {
+                                       return $field;
+                               }
+                       }
+               }
+
+               return [];
+
+       }
 
 	/**
 	 * Returns the physical file path for the generated PDF.
